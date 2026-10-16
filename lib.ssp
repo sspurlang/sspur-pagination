@@ -1,10 +1,20 @@
-// Offset pagination for list endpoints: clamped request parameters and a page with the total and
-// the offset of the next page.
+// Pagination for list endpoints: offset, page-number and keyset (cursor) pagination. Requests are
+// clamped (or checked strictly), pages know their neighbours, page-number ranges for UIs elide the
+// middle, cursors are opaque and signed with HMAC-SHA-256, and pages render as RFC 8288 Link
+// headers and JSON envelopes. Everything is pure.
+//
+// Clamping rules, in one place: a limit (page size) defaults to 20 and is kept within 1 to 100
+// (or the Limits given); an offset defaults to 0 and is never negative; a page number defaults to
+// 1 and is never below 1; text that isn't an integer counts as missing. Functions that read a Page
+// built by hand treat a limit below 1 as 1 and a negative offset or total as 0. Offsets saturate at
+// the largest Int instead of overflowing.
+
+// ---------- offset pagination ----------
 
 // A page of `items` out of `total`, starting at `offset`; `next` is the offset of the next page.
 pub type Page[T] = {items: List[T], total: Int, limit: Int, offset: Int, next: Opt[Int]} derive Eq, Show
 
-// A checked page request.
+// A checked page request: a page size of 1 to 100 and an offset of at least 0.
 pub type PageReq = {limit: Int where _ >= 1 and _ <= 100, offset: Int where _ >= 0} derive Eq, Show
 
 // The page request for query parameters that may be missing or out of range: `limit` defaults to
@@ -12,17 +22,760 @@ pub type PageReq = {limit: Int where _ >= 1 and _ <= 100, offset: Int where _ >=
 pub fn request(limit: Opt[Int], offset: Opt[Int]) -> PageReq
 = PageReq{limit: clamp(limit.or(20), 1, 100), offset: max(offset.or(0), 0)}
 
-// The page of `items` (already limited by the query) for request `r` out of `total` rows.
+// The page of `items` (already limited by the query) for request `r` out of `total` rows. `next`
+// is the offset after the last item while rows remain; an empty page has no `next`, so a client
+// that reads past the end (rows deleted meanwhile) stops instead of asking for the same offset.
 pub fn page[T](items: List[T], total: Int, r: PageReq) -> Page[T]
   pre total >= 0
-= Page{items: items, total: total, limit: r.limit, offset: r.offset, next: if r.offset + items.len < total then some(r.offset + items.len) else none}
+= do
+  end = r.offset.saturating_add(items.len)
+  Page{items, total, limit: r.limit, offset: r.offset, next: if items.len > 0 and end < total then some(end) else none}
 
-// The offset of the page before `p`, if there is one.
+// The offset of the page before `p`, if there is one: `none` on the first page, the start of the
+// last page when `p` lies past the end, else `limit` rows back (never below 0).
 pub fn prev[T](p: Page[T]) -> Opt[Int]
-= if p.offset > 0 then some(max(p.offset - p.limit, 0)) else none
+= if off(p) == 0 then none else if off(p) >= tot(p) then some(last_offset(tot(p), lim(p))) else some(max(off(p) - lim(p), 0))
+
+// Size limits for requests: the default page size and the largest one allowed, both within 1 to
+// 100 (the range of PageReq).
+pub type Limits = {default_limit: Int where _ >= 1 and _ <= 100, max_limit: Int where _ >= 1 and _ <= 100} derive Eq, Show
+
+// `request` with your own limits: `limit` defaults to `lim.default_limit` and is kept within 1 to
+// `lim.max_limit`; `offset` defaults to 0 and is never negative.
+pub fn request_in(lim: Limits, limit: Opt[Int], offset: Opt[Int]) -> PageReq
+  pre lim.default_limit <= lim.max_limit
+  post r.limit <= lim.max_limit
+= PageReq{limit: clamp(limit.or(lim.default_limit), 1, lim.max_limit), offset: max(offset.or(0), 0)}
+
+// `request` for raw query strings: each value is trimmed and read as an integer, and text that
+// isn't one (`"abc"`, `""`, `"1.5"`) counts as missing, so it gets the default.
+pub fn request_str(limit: Opt[Str], offset: Opt[Str]) -> PageReq
+= request(read_int(limit), read_int(offset))
+
+// Why a strict request was refused: a parameter that isn't an integer, or one outside its range
+// (`low` to `high`, inclusive).
+pub type ParamErr = NotANumber{param: Str, text: Str} | OutOfRange{param: Str, value: Int, low: Int, high: Int} derive Eq, Show
+
+// The page request for raw query strings, refusing bad values instead of clamping them: `limit`
+// must be within 1 to `lim.max_limit` and `offset` at least 0; a missing value gets its default.
+// The limit is checked first.
+pub fn strict_request(lim: Limits, limit: Opt[Str], offset: Opt[Str]) -> Res[PageReq, ParamErr]
+  pre lim.default_limit <= lim.max_limit
+= match (strict_int("limit", limit, lim.default_limit, 1, lim.max_limit), strict_int("offset", offset, 0, 0, max_int()))
+| (err(e), _) => err(e)
+| (_, err(e)) => err(e)
+| (ok(l), ok(o)) => ok(PageReq{limit: clamp(l, 1, 100), offset: max(o, 0)})
+
+// The page of the in-memory list `xs` for request `r`: its slice, with `total` the length of `xs`.
+pub fn paginate[T](xs: List[T], r: PageReq) -> Page[T]
+  post r.items.len <= r.limit
+= page(xs.drop(r.offset).take(r.limit), xs.len, r)
+
+// The rows `[start, end)` that request `r` covers in a list of `total` rows, clamped to the list:
+// both are `total` when the offset lies past the end.
+pub fn bounds(r: PageReq, total: Int where _ >= 0) -> (Int, Int)
+  post r.0 <= r.1 and r.1 <= total
+= (min(r.offset, total), min(r.offset.saturating_add(r.limit), total))
+
+// The request moved back onto the list when its offset lies past the end of `total` rows: the
+// start of the last page (0 for an empty list). Other requests are returned unchanged.
+pub fn clamp_req(r: PageReq, total: Int where _ >= 0) -> PageReq
+  post r.offset <= max(total, 0)
+= if r.offset >= total and r.offset > 0 then r with offset := last_offset(total, r.limit) else r
+
+// The offset of the last page of `total` rows in pages of `limit`: 0 for an empty list.
+pub fn last_offset(total: Int where _ >= 0, limit: Int where _ >= 1) -> Int
+  post r >= 0 and r <= total
+= if total == 0 then 0 else (total - 1) / limit * limit
+
+// The number of pages `total` rows fill in pages of `limit`: 0 for an empty list.
+pub fn count_pages(total: Int where _ >= 0, limit: Int where _ >= 1) -> Int
+  post r >= 0 and r <= total
+= if total == 0 then 0 else (total - 1) / limit + 1
+
+// ---------- page facts ----------
+
+// The number of pages in `p`'s list: 0 when it is empty.
+pub fn page_count[T](p: Page[T]) -> Int
+= count_pages(tot(p), lim(p))
+
+// The 1-based number of `p`: `offset / limit + 1`, so an offset that isn't a multiple of the limit
+// counts as the page it starts in. It can exceed `page_count` for a page past the end.
+pub fn page_number[T](p: Page[T]) -> Int
+= off(p) / lim(p) + 1
+
+// Whether a page follows `p` (its `next` is set).
+pub fn has_next[T](p: Page[T]) -> Bool
+= p.next.is_some
+
+// Whether a page comes before `p` (its offset is above 0).
+pub fn has_prev[T](p: Page[T]) -> Bool
+= prev(p).is_some
+
+// Whether `p` starts at offset 0.
+pub fn is_first[T](p: Page[T]) -> Bool
+= off(p) == 0
+
+// Whether no page follows `p`.
+pub fn is_last[T](p: Page[T]) -> Bool
+= p.next.is_none
+
+// Whether `p` has no items.
+pub fn is_empty_page[T](p: Page[T]) -> Bool
+= p.items.is_empty
+
+// Whether `p` lies past the end of its list: an offset above 0 that is at least the total.
+pub fn out_of_range[T](p: Page[T]) -> Bool
+= off(p) > 0 and off(p) >= tot(p)
+
+// The request for the page after `p`, if there is one.
+pub fn next_req[T](p: Page[T]) -> Opt[PageReq]
+= p.next.map(o => PageReq{limit: req_limit(p), offset: max(o, 0)})
+
+// The request for the page before `p`, if there is one.
+pub fn prev_req[T](p: Page[T]) -> Opt[PageReq]
+= prev(p).map(o => PageReq{limit: req_limit(p), offset: o})
+
+// The request for the first page of `p`'s list.
+pub fn first_req[T](p: Page[T]) -> PageReq
+= PageReq{limit: req_limit(p), offset: 0}
+
+// The request for the last page of `p`'s list (offset 0 when it is empty).
+pub fn last_req[T](p: Page[T]) -> PageReq
+= PageReq{limit: req_limit(p), offset: last_offset(tot(p), req_limit(p))}
+
+// The 1-based positions of the first and last item of `p` in its list, `none` when `p` is empty:
+// rows 21 to 40 of a list are `some((21, 40))`.
+pub fn shown_range[T](p: Page[T]) -> Opt[(Int, Int)]
+= if p.items.is_empty then none else some((off(p).saturating_add(1), off(p).saturating_add(p.items.len)))
+
+// A label for `p` such as `21-40 of 95`, `0 of 95` for an empty or out-of-range page, `0 of 0` for
+// an empty list.
+pub fn range_label[T](p: Page[T]) -> Str
+= match shown_range(p)
+| some((a, b)) => "{a}-{b} of {tot(p)}"
+| none => "0 of {tot(p)}"
+
+// `p` with `f` applied to each item; everything else is kept.
+pub fn map_items[A, B, e](p: Page[A], f: A -> B ! e) -> Page[B] ! e
+= Page{items: p.items.map(f), total: p.total, limit: p.limit, offset: p.offset, next: p.next}
+
+// ---------- page numbers ----------
+
+// A checked page-number request: a 1-based page `number` and a page `size` of 1 to 100.
+pub type NumReq = {number: Int where _ >= 1, size: Int where _ >= 1 and _ <= 100} derive Eq, Show
+
+// The page-number request for parameters that may be missing or out of range: `number` defaults to
+// 1 and is never below 1, `size` defaults to 20 and is kept within 1 to 100.
+pub fn numbered(number: Opt[Int], size: Opt[Int]) -> NumReq
+= NumReq{number: max(number.or(1), 1), size: clamp(size.or(20), 1, 100)}
+
+// `numbered` with your own limits for the page size.
+pub fn numbered_in(lim: Limits, number: Opt[Int], size: Opt[Int]) -> NumReq
+  pre lim.default_limit <= lim.max_limit
+  post r.size <= lim.max_limit
+= NumReq{number: max(number.or(1), 1), size: clamp(size.or(lim.default_limit), 1, lim.max_limit)}
+
+// `numbered` for raw query strings; text that isn't an integer counts as missing.
+pub fn numbered_str(number: Opt[Str], size: Opt[Str]) -> NumReq
+= numbered(read_int(number), read_int(size))
+
+// The page-number request for raw query strings, refusing bad values: `number` must be at least 1
+// and `size` within 1 to `lim.max_limit`; a missing value gets its default. The number is checked
+// first.
+pub fn strict_numbered(lim: Limits, number: Opt[Str], size: Opt[Str]) -> Res[NumReq, ParamErr]
+  pre lim.default_limit <= lim.max_limit
+= match (strict_int("page", number, 1, 1, max_int()), strict_int("size", size, lim.default_limit, 1, lim.max_limit))
+| (err(e), _) => err(e)
+| (_, err(e)) => err(e)
+| (ok(n), ok(s)) => ok(NumReq{number: max(n, 1), size: clamp(s, 1, 100)})
+
+// The offset request for page-number request `n`: offset `(number - 1) * size`, saturating at the
+// largest Int.
+pub fn offset_req(n: NumReq) -> PageReq
+= PageReq{limit: n.size, offset: (n.number - 1).saturating_mul(n.size)}
+
+// The page-number request for offset request `r`: the page its offset starts in.
+pub fn num_req(r: PageReq) -> NumReq
+= NumReq{number: r.offset / r.limit + 1, size: r.limit}
+
+// One entry of a page-number range for a UI: a page (marked when it is the current one), or an
+// ellipsis standing for two or more hidden pages.
+pub type PageItem = PageNo{number: Int, current: Bool} | Ellipsis derive Eq, Show
+
+// The page numbers to show for page `current` of `pages`: the first and last `edges` pages, and
+// `window` pages on each side of the current one, with an ellipsis for each run of two or more
+// hidden pages (a gap of one page shows that page instead). `current` is clamped into 1 to
+// `pages`; no pages give `[]`. Page 8 of 20 with window 1 and edges 1 is `1 … 7 [8] 9 … 20`.
+pub fn page_numbers(current: Int, pages: Int where _ >= 0, window: Int where _ >= 0 and _ <= 1000, edges: Int where _ >= 0 and _ <= 1000) -> List[PageItem]
+  post r.len <= pages
+= if pages == 0 then [] else do
+  cur = clamp(current, 1, pages)
+  shown = merge_spans([(1, min(edges, pages)), (max(cur - window, 1), min(cur.saturating_add(window), pages)), (max(pages - edges + 1, 1), pages)].filter(s => s.0 <= s.1))
+  var out = []
+  var seen = 0
+  for (a, b) in shown
+    if a - seen == 2 then out := out.push(PageNo{number: a - 1, current: a - 1 == cur}) else if a - seen > 2 then out := out.push(Ellipsis)
+    for n in a..b
+      out := out.push(PageNo{number: n, current: n == cur})
+    out := out.push(PageNo{number: b, current: b == cur})
+    seen := b
+  if pages - seen == 1 then out.push(PageNo{number: pages, current: pages == cur}) else if pages - seen > 1 then out.push(Ellipsis) else out
+
+// `page_numbers` for page `p`.
+pub fn page_numbers_for[T](p: Page[T], window: Int where _ >= 0 and _ <= 1000, edges: Int where _ >= 0 and _ <= 1000) -> List[PageItem]
+  post r.len <= page_count(p)
+= page_numbers(page_number(p), page_count(p), window, edges)
+
+// A page-number range as text: pages by number, the current one in brackets, and `…` for an
+// ellipsis, separated by spaces: `1 … 7 [8] 9 … 20`.
+pub fn page_numbers_text(items: List[PageItem]) -> Str
+= items.map(i => do
+  match i
+  | PageNo{number, current} => if current then "[{number}]" else number.str
+  | Ellipsis => "…").join(" ")
+
+// ---------- cursors (keyset pagination) ----------
+
+// The direction a cursor reads in: `Forward` gives the rows after its keys, `Backward` the rows
+// before them.
+pub type Dir = Forward | Backward derive Eq, Show
+
+// A position in a keyset-ordered list: the sort-key values of a row (as text, in the ORDER BY's
+// order), the direction to read in, and an optional expiry in Unix milliseconds.
+pub type Cursor = {keys: List[Str], dir: Dir, expires_ms: Opt[Int]} derive Eq, Show
+
+// Why a cursor token was refused: it isn't a cursor (`reason` says why), its signature doesn't
+// check (tampered with, another key, or another scope), it expired at `at_ms`, or it was written by
+// a newer version of the format.
+pub type CursorErr = Malformed{reason: Str} | BadSignature | Expired{at_ms: Int} | Unsupported{version: Int} derive Eq, Show
+
+// The cursor for the rows after `keys`.
+pub fn after(keys: List[Str]) -> Cursor
+= Cursor{keys, dir: Forward, expires_ms: none}
+
+// The cursor for the rows before `keys`.
+pub fn before(keys: List[Str]) -> Cursor
+= Cursor{keys, dir: Backward, expires_ms: none}
+
+// Whether `c` has expired at `now_ms` (Unix milliseconds): its expiry is at or before `now_ms`.
+pub fn is_expired(c: Cursor, now_ms: Int) -> Bool
+= c.expires_ms.map(e => e <= now_ms).or(false)
+
+// The opaque token for cursor `c`: base64url JSON, a `.`, and a 128-bit HMAC-SHA-256 tag over the
+// payload and `scope`. The scope ties a token to one query (say `"orders?status=open&sort=date"`),
+// so a cursor from another query or sort order is refused. Tokens are tamper-evident, not secret:
+// anyone can read the keys, so don't put secrets in them.
+pub fn encode_cursor(key: Secret[Bytes], scope: Str, c: Cursor) -> Str
+= do
+  body = json.encode(Wire{v: 1, k: c.keys, d: if c.dir == Forward then 0 else 1, e: c.expires_ms}).to_bytes.base64url
+  "{body}.{tag(key, scope, body).base64url}"
+
+// The cursor in token `token`, checked against `key` and `scope`; expiry is not checked (see
+// `decode_cursor_at`). Tokens over 4096 characters are `Malformed`.
+pub fn decode_cursor(key: Secret[Bytes], scope: Str, token: Str) -> Res[Cursor, CursorErr]
+= decode_cursor_any([key], scope, token, none)
+
+// `decode_cursor`, also refusing a cursor that has expired at `now_ms` (Unix milliseconds).
+pub fn decode_cursor_at(key: Secret[Bytes], scope: Str, token: Str, now_ms: Int) -> Res[Cursor, CursorErr]
+= decode_cursor_any([key], scope, token, some(now_ms))
+
+// `decode_cursor` for key rotation: the token is accepted when its tag checks under any of `keys`
+// (newest first, say), and, when `now_ms` is given, it must not have expired. An empty `keys` list
+// refuses every token as `BadSignature`.
+pub fn decode_cursor_any(keys: List[Secret[Bytes]], scope: Str, token: Str, now_ms: Opt[Int]) -> Res[Cursor, CursorErr]
+= do
+  if token.len > 4096 then return err(Malformed{reason: "the token is longer than 4096 characters"})
+  some((body, sig)) = token.split_once(".") else err(Malformed{reason: "the token has no signature"})
+  some(given) = from_base64url(sig) else err(Malformed{reason: "the signature is not base64url"})
+  if given.len != 16 then return err(Malformed{reason: "the signature is not 16 bytes"})
+  if not keys.any(k => crypto.equal(tag(k, scope, body), given)) then return err(BadSignature)
+  some(raw) = from_base64url(body) else err(Malformed{reason: "the payload is not base64url"})
+  some(text) = raw.to_str else err(Malformed{reason: "the payload is not UTF-8"})
+  ok(w) = json.decode[Wire](text) else err(Malformed{reason: "the payload is not a cursor"})
+  if w.v != 1 then return err(Unsupported{version: w.v})
+  c = Cursor{keys: w.k, dir: if w.d == 1 then Backward else Forward, expires_ms: w.e}
+  match now_ms
+  | some(t) if is_expired(c, t) => err(Expired{at_ms: c.expires_ms.or(0)})
+  | _ => ok(c)
+
+// The rows to fetch for a keyset page of `limit` (1 to a million): one more than the limit, so the
+// extra row tells whether another page follows.
+pub fn fetch_limit(limit: Int where _ >= 1 and _ <= 1000000) -> Int
+  post r == limit + 1
+= limit + 1
+
+// A keyset page before signing: its items in list order and the cursors of the next and previous
+// pages.
+pub type KeysetPage[T] = {items: List[T], next_page: Opt[Cursor], prev_page: Opt[Cursor]} derive Eq, Show
+
+// The keyset page for `rows` fetched for request `req` (`none` for the first page) with
+// `fetch_limit(limit)` rows: ascending after the cursor's keys for `Forward` (and the first page),
+// descending before them for `Backward`, as the database returns them. `key_of` gives a row's sort
+// keys. The extra row, if fetched, is dropped and only says another page follows; the items come
+// back in ascending order either way. A page reached by a cursor always has a way back, and an
+// empty page reached by a cursor points back at that cursor's keys.
+pub fn keyset[T, e](rows: List[T], limit: Int where _ >= 1 and _ <= 1000000, req: Opt[Cursor], key_of: T -> List[Str] ! e) -> KeysetPage[T] ! e
+  post r.items.len <= limit
+= do
+  more = rows.len > limit
+  back = req.map(_.dir == Backward).or(false)
+  items = if back then rows.take(limit).reverse else rows.take(limit)
+  firsts = items.first.map(key_of)
+  lasts = items.last.map(key_of)
+  at = req.map(_.keys).or([])
+  if back then KeysetPage{items, next_page: some(after(lasts.or(at))), prev_page: if more then firsts.map(before) else none} else KeysetPage{items, next_page: if more then lasts.map(after) else none, prev_page: if req.is_some then some(before(firsts.or(at))) else none}
+
+// The rows a database would return for `req` from the in-memory list `sorted` (ascending by sort
+// key): up to `fetch_limit(limit)` rows after the cursor's keys, or before them in descending
+// order for `Backward`. `cmp(row, keys)` is negative, 0 or positive as the row sorts before, at or
+// after the keys. Pass the result to `keyset`.
+pub fn seek[T, e](sorted: List[T], req: Opt[Cursor], limit: Int where _ >= 1 and _ <= 1000000, cmp: (T, List[Str]) -> Int ! e) -> List[T] ! e
+  post r.len <= limit + 1
+= match req
+| none => sorted.take(fetch_limit(limit))
+| some(c) => if c.dir == Forward then sorted.filter(x => cmp(x, c.keys) > 0).take(fetch_limit(limit)) else sorted.filter(x => cmp(x, c.keys) < 0).reverse.take(fetch_limit(limit))
+
+// A keyset page with signed cursor tokens, ready to send.
+pub type CursorPage[T] = {items: List[T], next_cursor: Opt[Str], prev_cursor: Opt[Str]} derive Eq, Show
+
+// `kp` with its cursors signed by `encode_cursor` under `key` and `scope`, each expiring at
+// `expires_ms` (Unix milliseconds) when given.
+pub fn sign_page[T](key: Secret[Bytes], scope: Str, kp: KeysetPage[T], expires_ms: Opt[Int]) -> CursorPage[T]
+= CursorPage{items: kp.items, next_cursor: kp.next_page.map(c => encode_cursor(key, scope, c with expires_ms := expires_ms)), prev_cursor: kp.prev_page.map(c => encode_cursor(key, scope, c with expires_ms := expires_ms))}
+
+// `cp` with `f` applied to each item; the cursors are kept.
+pub fn map_cursor_items[A, B, e](cp: CursorPage[A], f: A -> B ! e) -> CursorPage[B] ! e
+= CursorPage{items: cp.items.map(f), next_cursor: cp.next_cursor, prev_cursor: cp.prev_cursor}
+
+// ---------- HTTP: URLs, Link headers, JSON ----------
+
+// `url` with the query parameters `params` set: earlier values of those names are removed, the
+// others keep their order, the new ones are appended in order, and a fragment stays at the end.
+// Names and values are percent-encoded (RFC 3986 unreserved characters are kept).
+pub fn set_query(url: Str, params: List[(Str, Str)]) -> Str
+= do
+  (rest, frag) = match url.split_once("#")
+  | some((a, f)) => (a, "#" + f)
+  | none => (url, "")
+  (base, query) = match rest.split_once("?")
+  | some((a, q)) => (a, q)
+  | none => (rest, "")
+  names = params.map(kv => pct(kv.0))
+  kept = query.split("&").filter(q => q != "" and not names.contains(q.split_once("=").map(_.0).or(q)))
+  all = kept + params.map(kv => "{pct(kv.0)}={pct(kv.1)}")
+  if all.is_empty then base + frag else "{base}?{all.join("&")}{frag}"
+
+// The URL of request `r` on `url`, with `limit` and `offset` query parameters.
+pub fn offset_url(url: Str, r: PageReq) -> Str
+= set_query(url, [("limit", r.limit.str), ("offset", r.offset.str)])
+
+// The URL of page `number` of `size` on `url`, with the query parameters named `page_param` and
+// `size_param`.
+pub fn page_url(url: Str, number: Int, size: Int, page_param: Str, size_param: Str) -> Str
+= set_query(url, [(page_param, number.str), (size_param, size.str)])
+
+// The RFC 8288 Link header for `p` on `url`, with `limit` and `offset` parameters: `first`, `prev`
+// (when there is one), `next` (when there is one) and `last`, as `<url>; rel="next"` joined by `, `.
+pub fn link_header[T](url: Str, p: Page[T]) -> Str
+= link_text([some(("first", offset_url(url, first_req(p)))), prev_req(p).map(r => ("prev", offset_url(url, r))), next_req(p).map(r => ("next", offset_url(url, r))), some(("last", offset_url(url, last_req(p))))])
+
+// The Link header for `p` with page-number parameters named `page_param` and `size_param`
+// (say `page` and `per_page`).
+pub fn link_header_numbered[T](url: Str, p: Page[T], page_param: Str, size_param: Str) -> Str
+= do
+  s = req_limit(p)
+  n = page_number(p)
+  last = max(page_count(p), 1)
+  link_text([some(("first", page_url(url, 1, s, page_param, size_param))), if has_prev(p) then some(("prev", page_url(url, min(n - 1, last), s, page_param, size_param))) else none, if has_next(p) then some(("next", page_url(url, n + 1, s, page_param, size_param))) else none, some(("last", page_url(url, last, s, page_param, size_param)))])
+
+// The Link header for a cursor page: `prev` and `next` links that carry the cursor tokens in the
+// query parameter `param`; `""` when there is neither.
+pub fn cursor_link_header[T](url: Str, param: Str, cp: CursorPage[T]) -> Str
+= link_text([cp.prev_cursor.map(c => ("prev", set_query(url, [(param, c)]))), cp.next_cursor.map(c => ("next", set_query(url, [(param, c)])))])
+
+// One link of a parsed Link header: its target, one relation type (lowercase), and its other
+// parameters (names lowercase, quotes removed).
+pub type WebLink = {uri: Str, rel: Str, params: List[(Str, Str)]} derive Eq, Show
+
+// The links in an RFC 8288 Link header value, in order. A link with several relation types
+// (`rel="next last"`) gives one entry per type; links without `rel` or without `<...>` are
+// skipped, and commas and semicolons inside quoted strings are kept.
+pub fn parse_link_header(s: Str) -> List[WebLink]
+= split_quoted(s, ",").flat_map(one_link)
+
+// The target of the first link with relation `rel` (compared case-insensitively).
+pub fn rel_uri(links: List[WebLink], rel: Str) -> Opt[Str]
+= links.find(l => l.rel == rel.lower).map(_.uri)
+
+// The `X-Total-Count` header for `p`.
+pub fn total_count_header[T](p: Page[T]) -> (Str, Str)
+= ("X-Total-Count", tot(p).str)
+
+// The numbers of an offset page for a JSON body: total rows, page size, offset, the 1-based page
+// `number`, the number of `pages`, and the offsets of the neighbouring pages.
+pub type Meta = {total: Int, limit: Int, offset: Int, number: Int, pages: Int, next_offset: Opt[Int], prev_offset: Opt[Int]} derive Eq, Show
+
+// The URLs of an offset page and its neighbours for a JSON body.
+pub type Links = {self_url: Str, first_url: Str, prev_url: Opt[Str], next_url: Opt[Str], last_url: Str} derive Eq, Show
+
+// A JSON body for an offset page: `{"data": [...], "meta": {...}, "links": {...}}`.
+pub type Envelope[T] = {data: List[T], meta: Meta, links: Links} derive Eq, Show
+
+// The `Meta` of `p`.
+pub fn page_meta[T](p: Page[T]) -> Meta
+= Meta{total: tot(p), limit: lim(p), offset: off(p), number: page_number(p), pages: page_count(p), next_offset: p.next, prev_offset: prev(p)}
+
+// The `Links` of `p` on `url`, with `limit` and `offset` parameters.
+pub fn page_link_set[T](url: Str, p: Page[T]) -> Links
+= Links{self_url: offset_url(url, PageReq{limit: req_limit(p), offset: off(p)}), first_url: offset_url(url, first_req(p)), prev_url: prev_req(p).map(r => offset_url(url, r)), next_url: next_req(p).map(r => offset_url(url, r)), last_url: offset_url(url, last_req(p))}
+
+// The JSON envelope of `p` on `url`; `json.encode` it for the response body.
+pub fn envelope[T](url: Str, p: Page[T]) -> Envelope[T]
+= Envelope{data: p.items, meta: page_meta(p), links: page_link_set(url, p)}
+
+// A JSON body for a cursor page: the items, the cursor tokens, and the URLs that carry them.
+pub type CursorEnvelope[T] = {data: List[T], next_cursor: Opt[Str], prev_cursor: Opt[Str], next_url: Opt[Str], prev_url: Opt[Str]} derive Eq, Show
+
+// The JSON envelope of cursor page `cp` on `url`, with the tokens in the query parameter `param`.
+pub fn cursor_envelope[T](url: Str, param: Str, cp: CursorPage[T]) -> CursorEnvelope[T]
+= CursorEnvelope{data: cp.items, next_cursor: cp.next_cursor, prev_cursor: cp.prev_cursor, next_url: cp.next_cursor.map(c => set_query(url, [(param, c)])), prev_url: cp.prev_cursor.map(c => set_query(url, [(param, c)]))}
+
+// ---------- private helpers ----------
+
+type Wire = {v: Int, k: List[Str], d: Int, e: Opt[Int]}
+
+fn max_int() -> Int
+= 9223372036854775807
+
+fn lim[T](p: Page[T]) -> Int
+= max(p.limit, 1)
+
+fn off[T](p: Page[T]) -> Int
+= max(p.offset, 0)
+
+fn tot[T](p: Page[T]) -> Int
+= max(p.total, 0)
+
+fn req_limit[T](p: Page[T]) -> Int
+= clamp(p.limit, 1, 100)
+
+fn read_int(s: Opt[Str]) -> Opt[Int]
+= match s
+| some(t) => t.trim.to_int
+| none => none
+
+fn strict_int(param: Str, s: Opt[Str], default: Int, low: Int, high: Int) -> Res[Int, ParamErr]
+= match s
+| none => ok(default)
+| some(t) => match t.trim.to_int
+| none => err(NotANumber{param, text: t})
+| some(n) => if n < low or n > high then err(OutOfRange{param, value: n, low, high}) else ok(n)
+
+fn tag(key: Secret[Bytes], scope: Str, body: Str) -> Bytes
+= crypto.hmac256(key, "sspur-pagination-cursor-v1\n{scope}\n{body}").slice(0, 16)
+
+fn merge_spans(spans: List[(Int, Int)]) -> List[(Int, Int)]
+= do
+  var out = []
+  for (a, b) in spans.sort
+    out := match out.pop_back
+    | some(((x, y), init)) if a <= y + 1 => init.push((x, max(y, b)))
+    | _ => out.push((a, b))
+  out
+
+fn unreserved(c: Str) -> Bool
+= c.len == 1 and "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._~".contains(c)
+
+fn pct(s: Str) -> Str
+= s.chars.map(c => if unreserved(c) then c else c.bytes.map(b => "%" + b.format("02X")).join("")).join("")
+
+fn link_text(links: List[Opt[(Str, Str)]]) -> Str
+= links.flat_map(l => do
+  match l
+  | some((rel, u)) => ["<{u}>; rel=\"{rel}\""]
+  | none => []).join(", ")
+
+fn split_quoted(s: Str, sep: Str) -> List[Str]
+= do
+  var parts = []
+  var cur = str_buf()
+  var quoted = false
+  var escaped = false
+  for c in s.chars
+    if escaped then do
+        cur := cur.add(c)
+        escaped := false
+      else if quoted and c == "\\" then do
+          cur := cur.add(c)
+          escaped := true
+        else if c == "\"" then do
+            cur := cur.add(c)
+            quoted := not quoted
+          else if c == sep and not quoted then do
+              parts := parts.push(cur.str)
+              cur := str_buf()
+            else cur := cur.add(c)
+  parts.push(cur.str)
+
+fn unquote(s: Str) -> Str
+= do
+  t = s.trim
+  if t.len >= 2 and t.starts_with("\"") and t.ends_with("\"") then t.drop(1).take(t.len - 2).replace("\\\"", "\"").replace("\\\\", "\\") else t
+
+fn one_link(part: Str) -> List[WebLink]
+= do
+  t = part.trim
+  if not t.starts_with("<") then return []
+  some((uri, rest)) = t.drop(1).split_once(">") else []
+  params = split_quoted(rest, ";").filter(x => x.trim != "").map(x => do
+    match x.split_once("=")
+    | some((k, v)) => (k.trim.lower, unquote(v))
+    | none => (x.trim.lower, ""))
+  match params.find(_.0 == "rel")
+  | none => []
+  | some((_, rels)) => rels.lower.split(" ").filter(r => r != "").map(r => WebLink{uri, rel: r, params: params.filter(_.0 != "rel")})
+
+// ---------- tests ----------
+
+fn k1() -> Secret[Bytes]
+= secret("first test key".to_bytes)
+
+fn k2() -> Secret[Bytes]
+= secret("second test key".to_bytes)
+
+fn nums(n: Int) -> List[Int]
+= (1..n + 1).map(i => i)
+
+fn lim10() -> Limits
+= Limits{default_limit: 10, max_limit: 50}
+
+fn by_key(x: Int, keys: List[Str]) -> Int
+= x - keys.first.map(k => k.to_int.or(0)).or(0)
+
+fn key_str(x: Int) -> List[Str]
+= [x.str]
+
+fn walk_forward(xs: List[Int], limit: Int) -> List[List[Int]]
+= do
+  var pages = []
+  var req = none
+  for _ in 0..xs.len + 2
+    kp = keyset(seek(xs, req, limit, by_key), limit, req, key_str)
+    if kp.items.is_empty then return pages
+    pages := pages.push(kp.items)
+    match kp.next_page
+    | some(c) => req := decode_cursor(k1(), "s", encode_cursor(k1(), "s", c)).map(x => some(x)).or(none)
+    | none => return pages
+  pages
 
 test defaults = request(none, none) == PageReq{limit: 20, offset: 0}
-test clamped = request(some(1000), some(-5)) == PageReq{limit: 100, offset: 0} and request(some(0), none).limit == 1
+
+test clamped = request(some(1000), some(-5)) == PageReq{limit: 100, offset: 0} and request(some(0), none).limit == 1 and request(some(-3), some(7)) == PageReq{limit: 1, offset: 7}
+
+test huge_offset = request(some(5), some(9223372036854775807)).offset == 9223372036854775807
+
 test next_page = page([1, 2], 5, request(some(2), some(0))).next == some(2)
+
 test last_page = page([5], 5, request(some(2), some(4))).next == none and prev(page([5], 5, request(some(2), some(4)))) == some(2)
+
 test first_page = prev(page([1], 1, request(none, none))) == none
+
+test empty_list_page = page([], 0, request(none, none)) == Page{items: [], total: 0, limit: 20, offset: 0, next: none}
+
+test empty_page_has_no_next = page([], 10, request(some(5), some(3))).next == none
+
+test page_saturates = page([1], 10, request(some(5), some(9223372036854775807))).next == none
+
+test prev_past_end = prev(page([], 95, request(some(20), some(500)))) == some(80) and prev(page([], 0, request(some(20), some(40)))) == some(0)
+
+test prev_unaligned = prev(page([4, 5], 10, request(some(5), some(3)))) == some(0)
+
+test prev_hand_built = prev(Page{items: [1], total: 10, limit: 0, offset: 5, next: none}) == some(4) and prev(Page{items: [1], total: -3, limit: -2, offset: -1, next: none}) == none
+
+test limits_in = request_in(lim10(), none, none) == PageReq{limit: 10, offset: 0} and request_in(lim10(), some(80), some(-1)) == PageReq{limit: 50, offset: 0} and request_in(lim10(), some(0), some(4)).limit == 1
+
+test from_strings = request_str(some(" 30 "), some("12")) == PageReq{limit: 30, offset: 12} and request_str(some("abc"), some("1.5")) == request(none, none) and request_str(some(""), none) == request(none, none) and request_str(some("-4"), some("999")) == PageReq{limit: 1, offset: 999}
+
+test strict_ok = strict_request(lim10(), some("25"), some("40")) == ok(PageReq{limit: 25, offset: 40}) and strict_request(lim10(), none, none) == ok(PageReq{limit: 10, offset: 0})
+
+test strict_errors = strict_request(lim10(), some("x"), some("0")) == err(NotANumber{param: "limit", text: "x"}) and strict_request(lim10(), some("51"), none) == err(OutOfRange{param: "limit", value: 51, low: 1, high: 50}) and strict_request(lim10(), some("0"), some("-1")) == err(OutOfRange{param: "limit", value: 0, low: 1, high: 50}) and strict_request(lim10(), none, some("-1")) == err(OutOfRange{param: "offset", value: -1, low: 0, high: 9223372036854775807}) and strict_request(lim10(), none, some("1e3")) == err(NotANumber{param: "offset", text: "1e3"})
+
+test in_memory = paginate(nums(95), request(some(20), some(40))) == Page{items: (41..61).map(i => i), total: 95, limit: 20, offset: 40, next: some(60)}
+
+test in_memory_tail = paginate(nums(95), request(some(20), some(80))).items == (81..96).map(i => i) and paginate(nums(95), request(some(20), some(80))).next == none
+
+test in_memory_beyond = paginate(nums(3), request(some(2), some(10))) == Page{items: [], total: 3, limit: 2, offset: 10, next: none}
+
+test in_memory_empty = paginate([], request(none, none)) == Page{items: [], total: 0, limit: 20, offset: 0, next: none} and paginate(["é", "日本"], request(some(1), some(1))).items == ["日本"]
+
+test in_memory_huge = paginate(nums(100000), request(some(100), some(99950))).items.len == 50 and paginate(nums(100000), request(some(100), some(99950))).next == none
+
+test bounds_clamp = bounds(PageReq{limit: 20, offset: 40}, 95) == (40, 60) and bounds(PageReq{limit: 20, offset: 90}, 95) == (90, 95) and bounds(PageReq{limit: 20, offset: 200}, 95) == (95, 95) and bounds(PageReq{limit: 20, offset: 9223372036854775807}, 3) == (3, 3)
+
+test clamping_req = clamp_req(PageReq{limit: 20, offset: 500}, 95) == PageReq{limit: 20, offset: 80} and clamp_req(PageReq{limit: 20, offset: 40}, 95) == PageReq{limit: 20, offset: 40} and clamp_req(PageReq{limit: 20, offset: 20}, 0) == PageReq{limit: 20, offset: 0} and clamp_req(PageReq{limit: 20, offset: 0}, 0) == PageReq{limit: 20, offset: 0} and clamp_req(PageReq{limit: 20, offset: 95}, 95).offset == 80
+
+test last_offsets = last_offset(0, 20) == 0 and last_offset(1, 20) == 0 and last_offset(20, 20) == 0 and last_offset(21, 20) == 20 and last_offset(95, 20) == 80 and last_offset(9223372036854775807, 1) == 9223372036854775806
+
+test counting_pages = count_pages(0, 20) == 0 and count_pages(1, 20) == 1 and count_pages(20, 20) == 1 and count_pages(21, 20) == 2 and count_pages(95, 20) == 5 and count_pages(9223372036854775807, 1) == 9223372036854775807 and count_pages(9223372036854775807, 100) == 92233720368547759
+
+test facts_middle = do
+  p = paginate(nums(95), request(some(20), some(40)))
+  page_count(p) == 5 and page_number(p) == 3 and has_next(p) and has_prev(p) and not is_first(p) and not is_last(p) and not is_empty_page(p) and not out_of_range(p)
+
+test facts_ends = do
+  a = paginate(nums(95), request(some(20), none))
+  z = paginate(nums(95), request(some(20), some(80)))
+  is_first(a) and not has_prev(a) and has_next(a) and is_last(z) and not has_next(z) and has_prev(z) and page_number(z) == 5
+
+test facts_empty = do
+  e = paginate([], request(none, none))
+  page_count(e) == 0 and page_number(e) == 1 and is_first(e) and is_last(e) and is_empty_page(e) and not out_of_range(e) and not has_prev(e)
+
+test facts_beyond = do
+  b = paginate(nums(10), request(some(5), some(50)))
+  out_of_range(b) and is_empty_page(b) and page_number(b) == 11 and page_count(b) == 2 and prev_req(b) == some(PageReq{limit: 5, offset: 5})
+
+test neighbour_requests = do
+  p = paginate(nums(95), request(some(20), some(40)))
+  next_req(p) == some(PageReq{limit: 20, offset: 60}) and prev_req(p) == some(PageReq{limit: 20, offset: 20}) and first_req(p) == PageReq{limit: 20, offset: 0} and last_req(p) == PageReq{limit: 20, offset: 80}
+
+test neighbour_requests_edges = next_req(paginate(nums(3), request(none, none))) == none and prev_req(paginate(nums(3), request(none, none))) == none and last_req(paginate([], request(none, none))) == PageReq{limit: 20, offset: 0} and first_req(Page{items: [1], total: 1, limit: 500, offset: 0, next: none}).limit == 100
+
+test shown = shown_range(paginate(nums(95), request(some(20), some(20)))) == some((21, 40)) and shown_range(paginate(nums(95), request(some(20), some(80)))) == some((81, 95)) and shown_range(paginate([], request(none, none))) == none
+
+test labels = range_label(paginate(nums(95), request(some(20), some(20)))) == "21-40 of 95" and range_label(paginate(nums(95), request(some(20), some(400)))) == "0 of 95" and range_label(paginate([], request(none, none))) == "0 of 0" and range_label(paginate([7], request(none, none))) == "1-1 of 1"
+
+test mapping = map_items(paginate(nums(5), request(some(2), some(2))), i => "#{i}") == Page{items: ["#3", "#4"], total: 5, limit: 2, offset: 2, next: some(4)}
+
+test numbered_defaults = numbered(none, none) == NumReq{number: 1, size: 20} and numbered(some(0), some(0)) == NumReq{number: 1, size: 1} and numbered(some(-7), some(500)) == NumReq{number: 1, size: 100} and numbered(some(3), some(10)) == NumReq{number: 3, size: 10}
+
+test numbered_limits = numbered_in(lim10(), none, none) == NumReq{number: 1, size: 10} and numbered_in(lim10(), some(2), some(99)) == NumReq{number: 2, size: 50}
+
+test numbered_strings = numbered_str(some("4"), some(" 25")) == NumReq{number: 4, size: 25} and numbered_str(some("four"), some("")) == NumReq{number: 1, size: 20}
+
+test numbered_strict = strict_numbered(lim10(), some("2"), some("5")) == ok(NumReq{number: 2, size: 5}) and strict_numbered(lim10(), some("0"), none) == err(OutOfRange{param: "page", value: 0, low: 1, high: 9223372036854775807}) and strict_numbered(lim10(), some("p"), none) == err(NotANumber{param: "page", text: "p"}) and strict_numbered(lim10(), none, some("60")) == err(OutOfRange{param: "size", value: 60, low: 1, high: 50}) and strict_numbered(lim10(), none, none) == ok(NumReq{number: 1, size: 10})
+
+test number_offsets = offset_req(NumReq{number: 3, size: 20}) == PageReq{limit: 20, offset: 40} and offset_req(NumReq{number: 1, size: 7}) == PageReq{limit: 7, offset: 0} and offset_req(NumReq{number: 9223372036854775807, size: 100}).offset == 9223372036854775807
+
+test offsets_to_numbers = num_req(PageReq{limit: 20, offset: 40}) == NumReq{number: 3, size: 20} and num_req(PageReq{limit: 20, offset: 45}) == NumReq{number: 3, size: 20} and num_req(PageReq{limit: 1, offset: 0}) == NumReq{number: 1, size: 1}
+
+test numbers_example = page_numbers_text(page_numbers(8, 20, 1, 1)) == "1 … 7 [8] 9 … 20" and page_numbers_text(page_numbers(8, 20, 1, 2)) == "1 2 … 7 [8] 9 … 19 20"
+
+test numbers_small = page_numbers_text(page_numbers(1, 1, 2, 1)) == "[1]" and page_numbers_text(page_numbers(3, 5, 2, 1)) == "1 2 [3] 4 5" and page_numbers(1, 0, 2, 1) == []
+
+test numbers_one_page_gap = page_numbers_text(page_numbers(4, 9, 1, 1)) == "1 2 3 [4] 5 … 9" and page_numbers_text(page_numbers(5, 9, 1, 1)) == "1 … 4 [5] 6 … 9" and page_numbers_text(page_numbers(6, 9, 1, 1)) == "1 … 5 [6] 7 8 9"
+
+test numbers_ends = page_numbers_text(page_numbers(1, 20, 2, 1)) == "[1] 2 3 … 20" and page_numbers_text(page_numbers(20, 20, 2, 1)) == "1 … 18 19 [20]"
+
+test numbers_no_edges = page_numbers_text(page_numbers(10, 20, 1, 0)) == "… 9 [10] 11 …" and page_numbers_text(page_numbers(2, 20, 0, 0)) == "1 [2] …" and page_numbers_text(page_numbers(10, 20, 0, 0)) == "… [10] …"
+
+test numbers_clamped_current = page_numbers_text(page_numbers(99, 5, 1, 1)) == "1 … 4 [5]" and page_numbers_text(page_numbers(-3, 5, 1, 1)) == "[1] 2 … 5"
+
+test numbers_huge = page_numbers_text(page_numbers(5000000000, 9223372036854775807, 1, 1)) == "1 … 4999999999 [5000000000] 5000000001 … 9223372036854775807" and page_numbers(3, 6, 1000, 1000).len == 6
+
+test numbers_items = page_numbers(2, 3, 0, 1) == [PageNo{number: 1, current: false}, PageNo{number: 2, current: true}, PageNo{number: 3, current: false}] and page_numbers(5, 10, 0, 1)[1] == Ellipsis
+
+test numbers_for_page = page_numbers_text(page_numbers_for(paginate(nums(200), request(some(10), some(70))), 1, 1)) == "1 … 7 [8] 9 … 20" and page_numbers_for(paginate([], request(none, none)), 2, 2) == []
+
+test cursor_round_trip = decode_cursor(k1(), "orders", encode_cursor(k1(), "orders", after(["2026-10-01", "42"]))) == ok(after(["2026-10-01", "42"])) and decode_cursor(k1(), "", encode_cursor(k1(), "", before([]))) == ok(before([]))
+
+test cursor_unicode = decode_cursor(k1(), "é", encode_cursor(k1(), "é", after(["日本語", "a,b;\"c\"", "\n"]))) == ok(after(["日本語", "a,b;\"c\"", "\n"]))
+
+test cursor_opaque = do
+  t = encode_cursor(k1(), "s", after(["1"]))
+  t.split(".").len == 2 and not t.contains("+") and not t.contains("/") and not t.contains("=") and set_query("/x", [("cursor", t)]) == "/x?cursor={t}"
+
+test cursor_wrong_key = decode_cursor(k2(), "s", encode_cursor(k1(), "s", after(["1"]))) == err(BadSignature)
+
+test cursor_wrong_scope = decode_cursor(k1(), "t", encode_cursor(k1(), "s", after(["1"]))) == err(BadSignature) and decode_cursor(k1(), "s\n", encode_cursor(k1(), "s", after(["1"]))) == err(BadSignature)
+
+test cursor_tampered = do
+  t = encode_cursor(k1(), "s", after(["1"]))
+  some((body, sig)) = t.split_once(".") else false
+  forged = "{json.encode(Wire{v: 1, k: ["2"], d: 0, e: none}).to_bytes.base64url}.{sig}"
+  decode_cursor(k1(), "s", forged) == err(BadSignature) and decode_cursor(k1(), "s", "{body}.AAAA") == err(Malformed{reason: "the signature is not 16 bytes"})
+
+test cursor_malformed = decode_cursor(k1(), "s", "") == err(Malformed{reason: "the token has no signature"}) and decode_cursor(k1(), "s", "abc") == err(Malformed{reason: "the token has no signature"}) and decode_cursor(k1(), "s", "a.@@") == err(Malformed{reason: "the signature is not base64url"}) and decode_cursor(k1(), "s", "x".repeat(5000)) == err(Malformed{reason: "the token is longer than 4096 characters"})
+
+test cursor_signed_garbage = do
+  body = "not json".to_bytes.base64url
+  decode_cursor(k1(), "s", "{body}.{tag(k1(), "s", body).base64url}") == err(Malformed{reason: "the payload is not a cursor"}) and decode_cursor(k1(), "s", "@.{tag(k1(), "s", "@").base64url}") == err(Malformed{reason: "the payload is not base64url"})
+
+test cursor_future_version = do
+  body = json.encode(Wire{v: 2, k: [], d: 0, e: none}).to_bytes.base64url
+  decode_cursor(k1(), "s", "{body}.{tag(k1(), "s", body).base64url}") == err(Unsupported{version: 2})
+
+test cursor_expiry = do
+  t = encode_cursor(k1(), "s", after(["1"]) with expires_ms := some(1000))
+  decode_cursor_at(k1(), "s", t, 999).is_ok and decode_cursor_at(k1(), "s", t, 1000) == err(Expired{at_ms: 1000}) and decode_cursor(k1(), "s", t).is_ok and is_expired(after([]), 9223372036854775807) == false and is_expired(after([]) with expires_ms := some(5), 5)
+
+test cursor_rotation = do
+  t = encode_cursor(k2(), "s", before(["9"]))
+  decode_cursor_any([k1(), k2()], "s", t, none) == ok(before(["9"])) and decode_cursor_any([], "s", t, none) == err(BadSignature) and decode_cursor_any([k1()], "s", t, none) == err(BadSignature) and decode_cursor_any([k2()], "s", encode_cursor(k2(), "s", before(["9"]) with expires_ms := some(3)), some(4)) == err(Expired{at_ms: 3})
+
+test fetch_size = fetch_limit(20) == 21 and fetch_limit(1) == 2 and fetch_limit(1000000) == 1000001
+
+test keyset_first = keyset([1, 2, 3], 2, none, key_str) == KeysetPage{items: [1, 2], next_page: some(after(["2"])), prev_page: none} and keyset([1, 2], 2, none, key_str) == KeysetPage{items: [1, 2], next_page: none, prev_page: none} and keyset([], 2, none, key_str) == KeysetPage{items: [], next_page: none, prev_page: none}
+
+test keyset_forward = keyset([3, 4, 5], 2, some(after(["2"])), key_str) == KeysetPage{items: [3, 4], next_page: some(after(["4"])), prev_page: some(before(["3"]))} and keyset([5], 2, some(after(["4"])), key_str) == KeysetPage{items: [5], next_page: none, prev_page: some(before(["5"]))}
+
+test keyset_forward_past_end = keyset([], 2, some(after(["9"])), key_str) == KeysetPage{items: [], next_page: none, prev_page: some(before(["9"]))}
+
+test keyset_backward = keyset([4, 3, 2], 2, some(before(["5"])), key_str) == KeysetPage{items: [3, 4], next_page: some(after(["4"])), prev_page: some(before(["3"]))} and keyset([2, 1], 2, some(before(["3"])), key_str) == KeysetPage{items: [1, 2], next_page: some(after(["2"])), prev_page: none} and keyset([], 2, some(before(["1"])), key_str) == KeysetPage{items: [], next_page: some(after(["1"])), prev_page: none}
+
+test seeking = seek(nums(10), none, 3, by_key) == [1, 2, 3, 4] and seek(nums(10), some(after(["4"])), 3, by_key) == [5, 6, 7, 8] and seek(nums(10), some(before(["4"])), 3, by_key) == [3, 2, 1] and seek(nums(10), some(after(["10"])), 3, by_key) == [] and seek([], some(before(["1"])), 3, by_key) == []
+
+test seeking_gaps = seek([10, 20, 30, 40], some(after(["25"])), 1, by_key) == [30, 40] and seek([10, 20, 30, 40], some(before(["25"])), 5, by_key) == [20, 10]
+
+test keyset_walk = walk_forward(nums(7), 3) == [[1, 2, 3], [4, 5, 6], [7]] and walk_forward(nums(6), 3) == [[1, 2, 3], [4, 5, 6]] and walk_forward([], 3) == [] and walk_forward(nums(1), 5) == [[1]]
+
+test keyset_back_and_forth = do
+  p2 = keyset(seek(nums(9), some(after(["3"])), 3, by_key), 3, some(after(["3"])), key_str)
+  back = p2.prev_page.get
+  p1 = keyset(seek(nums(9), some(back), 3, by_key), 3, some(back), key_str)
+  p2.items == [4, 5, 6] and p1.items == [1, 2, 3] and p1.prev_page == none and p1.next_page == some(after(["3"]))
+
+test signing = do
+  cp = sign_page(k1(), "s", KeysetPage{items: [1], next_page: some(after(["1"])), prev_page: none}, some(77))
+  cp.items == [1] and cp.prev_cursor == none and cp.next_cursor.map(t => decode_cursor(k1(), "s", t)) == some(ok(after(["1"]) with expires_ms := some(77)))
+
+test signing_no_expiry = sign_page(k1(), "s", KeysetPage{items: [], next_page: none, prev_page: some(before(["2"]))}, none).prev_cursor.map(t => decode_cursor(k1(), "s", t)) == some(ok(before(["2"])))
+
+test mapping_cursor_pages = map_cursor_items(CursorPage{items: [1, 2], next_cursor: some("n"), prev_cursor: none}, _ * 10) == CursorPage{items: [10, 20], next_cursor: some("n"), prev_cursor: none}
+
+test queries = set_query("/items", [("limit", "20")]) == "/items?limit=20" and set_query("/items?q=a%20b&limit=5&sort=name", [("limit", "20"), ("offset", "40")]) == "/items?q=a%20b&sort=name&limit=20&offset=40" and set_query("https://x.dev/a?b#top", [("p", "2")]) == "https://x.dev/a?b&p=2#top"
+
+test query_encoding = set_query("/s", [("q", "a b&c=é/日")]) == "/s?q=a%20b%26c%3D%C3%A9%2F%E6%97%A5" and set_query("/s?", []) == "/s" and set_query("/s?a=1&&a=2&b", [("a", "3")]) == "/s?b&a=3" and set_query("", []) == ""
+
+test urls = offset_url("/items", PageReq{limit: 20, offset: 40}) == "/items?limit=20&offset=40" and page_url("/items?x=1", 3, 25, "page", "per_page") == "/items?x=1&page=3&per_page=25"
+
+test link_offsets = link_header("/items", paginate(nums(95), request(some(20), some(40)))) == "</items?limit=20&offset=0>; rel=\"first\", </items?limit=20&offset=20>; rel=\"prev\", </items?limit=20&offset=60>; rel=\"next\", </items?limit=20&offset=80>; rel=\"last\""
+
+test link_offsets_ends = link_header("/i", paginate(nums(3), request(none, none))) == "</i?limit=20&offset=0>; rel=\"first\", </i?limit=20&offset=0>; rel=\"last\"" and link_header("/i", paginate([], request(some(5), some(10)))) == "</i?limit=5&offset=0>; rel=\"first\", </i?limit=5&offset=0>; rel=\"prev\", </i?limit=5&offset=0>; rel=\"last\""
+
+test link_numbers = link_header_numbered("/i", paginate(nums(95), request(some(20), some(40))), "page", "per_page") == "</i?page=1&per_page=20>; rel=\"first\", </i?page=2&per_page=20>; rel=\"prev\", </i?page=4&per_page=20>; rel=\"next\", </i?page=5&per_page=20>; rel=\"last\"" and link_header_numbered("/i", paginate([], request(none, none)), "p", "n") == "</i?p=1&n=20>; rel=\"first\", </i?p=1&n=20>; rel=\"last\""
+
+test link_numbers_past_end = link_header_numbered("/i", paginate(nums(10), request(some(5), some(50))), "p", "n") == "</i?p=1&n=5>; rel=\"first\", </i?p=2&n=5>; rel=\"prev\", </i?p=2&n=5>; rel=\"last\""
+
+test link_cursors = cursor_link_header("/i?a=1", "cursor", CursorPage{items: [1], next_cursor: some("N.x"), prev_cursor: some("P.y")}) == "</i?a=1&cursor=P.y>; rel=\"prev\", </i?a=1&cursor=N.x>; rel=\"next\"" and cursor_link_header("/i", "c", CursorPage{items: [], next_cursor: none, prev_cursor: none}) == ""
+
+test parsing_links = parse_link_header("<https://api.x.dev/i?page=2>; rel=\"next\", <https://api.x.dev/i?page=5>; rel=\"last\"") == [WebLink{uri: "https://api.x.dev/i?page=2", rel: "next", params: []}, WebLink{uri: "https://api.x.dev/i?page=5", rel: "last", params: []}]
+
+test parsing_links_quirks = parse_link_header("<a>; REL=\"Next Last\"; title=\"x, y; z\", <b>; type=text/html, junk, <c>;rel=prev") == [WebLink{uri: "a", rel: "next", params: [("title", "x, y; z")]}, WebLink{uri: "a", rel: "last", params: [("title", "x, y; z")]}, WebLink{uri: "c", rel: "prev", params: []}] and parse_link_header("") == [] and parse_link_header("<a>; rel=\"x \\\"q\\\"\"") == [WebLink{uri: "a", rel: "x", params: []}, WebLink{uri: "a", rel: "\"q\"", params: []}]
+
+test links_round_trip = do
+  links = parse_link_header(link_header("/items", paginate(nums(95), request(some(20), some(40)))))
+  rel_uri(links, "next") == some("/items?limit=20&offset=60") and rel_uri(links, "PREV") == some("/items?limit=20&offset=20") and rel_uri(links, "self") == none and links.len == 4
+
+test total_header = total_count_header(paginate(nums(95), request(none, none))) == ("X-Total-Count", "95") and total_count_header(Page{items: [1], total: -1, limit: 1, offset: 0, next: none}) == ("X-Total-Count", "0")
+
+test meta_shape = page_meta(paginate(nums(95), request(some(20), some(40)))) == Meta{total: 95, limit: 20, offset: 40, number: 3, pages: 5, next_offset: some(60), prev_offset: some(20)} and page_meta(paginate([], request(none, none))) == Meta{total: 0, limit: 20, offset: 0, number: 1, pages: 0, next_offset: none, prev_offset: none}
+
+test link_set_shape = page_link_set("/i", paginate(nums(95), request(some(20), some(80)))) == Links{self_url: "/i?limit=20&offset=80", first_url: "/i?limit=20&offset=0", prev_url: some("/i?limit=20&offset=60"), next_url: none, last_url: "/i?limit=20&offset=80"}
+
+test envelope_json = json.encode(envelope("/i", paginate(["a", "b", "c"], request(some(2), none)))) == "\{\"data\":[\"a\",\"b\"],\"meta\":\{\"total\":3,\"limit\":2,\"offset\":0,\"number\":1,\"pages\":2,\"next_offset\":2,\"prev_offset\":null},\"links\":\{\"self_url\":\"/i?limit=2&offset=0\",\"first_url\":\"/i?limit=2&offset=0\",\"prev_url\":null,\"next_url\":\"/i?limit=2&offset=2\",\"last_url\":\"/i?limit=2&offset=2\"}}"
+
+test cursor_envelope_json = json.encode(cursor_envelope("/i", "cursor", CursorPage{items: [1], next_cursor: some("t.s"), prev_cursor: none})) == "\{\"data\":[1],\"next_cursor\":\"t.s\",\"prev_cursor\":null,\"next_url\":\"/i?cursor=t.s\",\"prev_url\":null}"
+
+test page_json = json.encode(paginate([1, 2, 3], request(some(2), none))) == "\{\"items\":[1,2],\"total\":3,\"limit\":2,\"offset\":0,\"next\":2}" and json.decode[Page[Int]]("\{\"items\":[1,2],\"total\":3,\"limit\":2,\"offset\":0,\"next\":2}") == ok(paginate([1, 2, 3], request(some(2), none)))
