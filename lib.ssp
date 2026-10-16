@@ -102,7 +102,7 @@ pub fn page_count[T](p: Page[T]) -> Int
 // The 1-based number of `p`: `offset / limit + 1`, so an offset that isn't a multiple of the limit
 // counts as the page it starts in. It can exceed `page_count` for a page past the end.
 pub fn page_number[T](p: Page[T]) -> Int
-= off(p) / lim(p) + 1
+= (off(p) / lim(p)).saturating_add(1)
 
 // Whether a page follows `p` (its `next` is set).
 pub fn has_next[T](p: Page[T]) -> Bool
@@ -197,7 +197,7 @@ pub fn offset_req(n: NumReq) -> PageReq
 
 // The page-number request for offset request `r`: the page its offset starts in.
 pub fn num_req(r: PageReq) -> NumReq
-= NumReq{number: r.offset / r.limit + 1, size: r.limit}
+= NumReq{number: (r.offset / r.limit).saturating_add(1), size: r.limit}
 
 // One entry of a page-number range for a UI: a page (marked when it is the current one), or an
 // ellipsis standing for two or more hidden pages.
@@ -387,7 +387,7 @@ pub fn link_header_numbered[T](url: Str, p: Page[T], page_param: Str, size_param
   s = req_limit(p)
   n = page_number(p)
   last = max(page_count(p), 1)
-  link_text([some(("first", page_url(url, 1, s, page_param, size_param))), if has_prev(p) then some(("prev", page_url(url, min(n - 1, last), s, page_param, size_param))) else none, if has_next(p) then some(("next", page_url(url, n + 1, s, page_param, size_param))) else none, some(("last", page_url(url, last, s, page_param, size_param)))])
+  link_text([some(("first", page_url(url, 1, s, page_param, size_param))), if has_prev(p) then some(("prev", page_url(url, min(n - 1, last), s, page_param, size_param))) else none, if has_next(p) then some(("next", page_url(url, n.saturating_add(1), s, page_param, size_param))) else none, some(("last", page_url(url, last, s, page_param, size_param)))])
 
 // The Link header for a cursor page: `prev` and `next` links that carry the cursor tokens in the
 // query parameter `param`; `""` when there is neither.
@@ -658,7 +658,7 @@ test numbered_strict = strict_numbered(lim10(), some("2"), some("5")) == ok(NumR
 
 test number_offsets = offset_req(NumReq{number: 3, size: 20}) == PageReq{limit: 20, offset: 40} and offset_req(NumReq{number: 1, size: 7}) == PageReq{limit: 7, offset: 0} and offset_req(NumReq{number: 9223372036854775807, size: 100}).offset == 9223372036854775807
 
-test offsets_to_numbers = num_req(PageReq{limit: 20, offset: 40}) == NumReq{number: 3, size: 20} and num_req(PageReq{limit: 20, offset: 45}) == NumReq{number: 3, size: 20} and num_req(PageReq{limit: 1, offset: 0}) == NumReq{number: 1, size: 1}
+test offsets_to_numbers = num_req(PageReq{limit: 1, offset: 9223372036854775807}).number == 9223372036854775807 and page_number(Page{items: [], total: 0, limit: 1, offset: 9223372036854775807, next: none}) == 9223372036854775807 and num_req(PageReq{limit: 20, offset: 40}) == NumReq{number: 3, size: 20} and num_req(PageReq{limit: 20, offset: 45}) == NumReq{number: 3, size: 20} and num_req(PageReq{limit: 1, offset: 0}) == NumReq{number: 1, size: 1}
 
 test numbers_example = page_numbers_text(page_numbers(8, 20, 1, 1)) == "1 … 7 [8] 9 … 20" and page_numbers_text(page_numbers(8, 20, 1, 2)) == "1 2 … 7 [8] 9 … 19 20"
 
