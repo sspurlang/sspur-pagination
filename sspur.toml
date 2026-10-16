@@ -1,5 +1,5 @@
 [package]
 name = "pagination"
-version = "0.1.0"
+version = "0.1.1"
 description = "Offset pagination for list endpoints: clamped page requests and pages with a next offset"
 license = "MIT"
