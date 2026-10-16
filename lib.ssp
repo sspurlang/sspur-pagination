@@ -2,10 +2,10 @@
 // the offset of the next page.
 
 // A page of `items` out of `total`, starting at `offset`; `next` is the offset of the next page.
-pub type Page[T] = {items: List[T], total: Int, limit: Int, offset: Int, next: Opt[Int]}
+pub type Page[T] = {items: List[T], total: Int, limit: Int, offset: Int, next: Opt[Int]} derive Eq, Show
 
 // A checked page request.
-pub type PageReq = {limit: Int where _ >= 1 and _ <= 100, offset: Int where _ >= 0}
+pub type PageReq = {limit: Int where _ >= 1 and _ <= 100, offset: Int where _ >= 0} derive Eq, Show
 
 // The page request for query parameters that may be missing or out of range: `limit` defaults to
 // 20 and is kept within 1 to 100, `offset` defaults to 0 and is never negative.
